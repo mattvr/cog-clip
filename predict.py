@@ -1,4 +1,8 @@
+import sys
+import requests
+import torch
 from typing import List, Union
+from io import BytesIO
 from PIL import Image
 from transformers import CLIPProcessor, CLIPModel
 from cog import BasePredictor, Path, Input, BaseModel, File
@@ -66,24 +70,42 @@ class Predictor(BasePredictor):
         if not texts:
             texts = None
 
-        inputs = self.processor(
-            text=texts, images=images, return_tensors="pt", padding=True
-        ).to("cuda")
+        # Process texts and images separately to handle padding correctly
+        text_inputs = None
+        if texts:
+            text_inputs = self.processor.tokenizer(
+                texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=77  # CLIP's default max length
+            ).to("cuda")
+
+        image_inputs = None
+        if images:
+            # Process images one by one to ensure consistent tensors
+            processed_images = []
+            for img in images:
+                processed = self.processor.feature_extractor(
+                    img, 
+                    return_tensors="pt"
+                )
+                processed_images.append(processed["pixel_values"][0])
+            
+            if processed_images:
+                image_inputs = {
+                    "pixel_values": torch.stack(processed_images).to("cuda")
+                }
 
         # Get embeddings
         text_outputs = {}
-        if texts:
-            text_embeds = self.model.get_text_features(
-                input_ids=inputs["input_ids"], 
-                attention_mask=inputs["attention_mask"]
-            )
+        if text_inputs:
+            text_embeds = self.model.get_text_features(**text_inputs)
             text_outputs = dict(zip(texts, text_embeds))
 
         image_outputs = {}
-        if images:
-            image_embeds = self.model.get_image_features(
-                pixel_values=inputs["pixel_values"]
-            )
+        if image_inputs:
+            image_embeds = self.model.get_image_features(**image_inputs)
             image_outputs = dict(zip(image_identifiers, image_embeds))
 
         # Construct output
