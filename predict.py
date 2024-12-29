@@ -1,8 +1,9 @@
+import re
 import sys
+import base64
 import requests
-import torch
-from typing import List, Union
 from io import BytesIO
+from typing import List, Optional
 from PIL import Image
 from transformers import CLIPProcessor, CLIPModel
 from cog import BasePredictor, Path, Input, BaseModel, File
@@ -20,104 +21,118 @@ class Predictor(BasePredictor):
     def predict(
         self,
         inputs: str = Input(
-            description="Newline-separated inputs. Can be text strings, image files, or image URLs starting with http[s]://",
+            description="Newline-separated inputs. Can be text strings, base64 data URIs, or image URLs starting with http[s]://",
             default="a\nb",
         ),
-        image_file: File = Input(
-            description="Direct image file input",
+        # optional list of direct image files
+        image_files: Optional[List[File]] = Input(
+            description="List of direct image files for batch processing",
             default=None
         )
     ) -> List[NamedEmbedding]:
+
         lines = []
         texts = []
         images = []
-        image_identifiers = []  # Store either URLs or file paths
+        image_ids = []  # keep track of 'keys' for each image (url/file/base64)
 
-        # Handle direct file input first
-        if image_file:
-            image = Image.open(image_file)
-            images.append(image)
-            image_identifiers.append(str(image_file))
-            lines.append(str(image_file))
-
-        # Process newline-separated inputs
+        # 1) parse lines from the `inputs` string
         for line in inputs.strip().splitlines():
             line = line.strip()
             lines.append(line)
-            
-            if line.startswith(('http://', 'https://')):
+
+            # handle base64 data: e.g. data:image/png;base64,ABCD...
+            if line.startswith("data:image/"):
+                try:
+                    # strip out prefix like data:image/png;base64,
+                    base64_data = re.sub(r"^data:image\/[a-zA-Z]+;base64,", "", line)
+                    raw = base64.b64decode(base64_data)
+                    image = Image.open(BytesIO(raw))
+                    images.append(image)
+                    image_ids.append(line)
+                except Exception as e:
+                    print(f"Failed to decode base64 image: {e}", file=sys.stderr)
+            # handle remote image URLs
+            elif re.match(r"^https?://", line):
                 try:
                     print(f"Downloading {line}", file=sys.stderr)
                     image = Image.open(BytesIO(requests.get(line).content))
                     images.append(image)
-                    image_identifiers.append(line)
+                    image_ids.append(line)
                 except Exception as e:
                     print(f"Failed to load {line}: {e}", file=sys.stderr)
-            elif Path(line).exists():  # Check if input is a valid file path
-                try:
-                    image = Image.open(line)
-                    images.append(image)
-                    image_identifiers.append(line)
-                except Exception as e:
-                    print(f"Failed to load file {line}: {e}", file=sys.stderr)
-                    texts.append(line)  # Fallback to treating as text
             else:
+                # otherwise, treat it as text
                 texts.append(line)
 
-        # Process inputs through CLIP
+        # 2) parse direct image files if provided
+        if image_files:
+            for idx, f in enumerate(image_files):
+                try:
+                    image = Image.open(f)
+                    images.append(image)
+                    # give each file a unique placeholder ID so we can output it later
+                    file_key = f"file_{idx}"
+                    image_ids.append(file_key)
+                    lines.append(file_key)  # so final output is consistent with text paths
+                except Exception as e:
+                    print(f"Failed to open file {f.name}: {e}", file=sys.stderr)
+
+        # handle 'None' inputs for processor
         if not images:
-            images = None
+            images_for_processor = None
+        else:
+            images_for_processor = images
+
         if not texts:
-            texts = None
+            texts_for_processor = None
+        else:
+            texts_for_processor = texts
 
-        # Process texts and images separately to handle padding correctly
-        text_inputs = None
-        if texts:
-            text_inputs = self.processor.tokenizer(
-                texts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=77  # CLIP's default max length
-            ).to("cuda")
+        # 3) run through CLIP processor
+        proc_inputs = self.processor(
+            text=texts_for_processor,
+            images=images_for_processor,
+            return_tensors="pt",
+            padding=True
+        ).to("cuda")
 
-        image_inputs = None
-        if images:
-            # Process images one by one to ensure consistent tensors
-            processed_images = []
-            for img in images:
-                processed = self.processor.feature_extractor(
-                    img, 
-                    return_tensors="pt"
-                )
-                processed_images.append(processed["pixel_values"][0])
-            
-            if processed_images:
-                image_inputs = {
-                    "pixel_values": torch.stack(processed_images).to("cuda")
-                }
-
-        # Get embeddings
+        # 4) get embeddings
         text_outputs = {}
-        if text_inputs:
-            text_embeds = self.model.get_text_features(**text_inputs)
-            text_outputs = dict(zip(texts, text_embeds))
-
         image_outputs = {}
-        if image_inputs:
-            image_embeds = self.model.get_image_features(**image_inputs)
-            image_outputs = dict(zip(image_identifiers, image_embeds))
 
-        # Construct output
+        if texts_for_processor is not None:
+            text_embeds = self.model.get_text_features(
+                input_ids=proc_inputs["input_ids"],
+                attention_mask=proc_inputs["attention_mask"]
+            )
+            # map each text to its corresponding embedding
+            text_outputs = dict(zip(texts_for_processor, text_embeds))
+
+        if images_for_processor is not None:
+            image_embeds = self.model.get_image_features(
+                pixel_values=proc_inputs["pixel_values"]
+            )
+            # map each image key to its corresponding embedding
+            image_outputs = dict(zip(image_ids, image_embeds))
+
+        # 5) build outputs in the same order as lines
         outputs = []
         for line in lines:
+            # if line was text
             if line in text_outputs:
-                outputs.append(
-                    NamedEmbedding(input=line, embedding=text_outputs[line].tolist())
-                )
+                outputs.append(NamedEmbedding(
+                    input=line,
+                    embedding=text_outputs[line].tolist()
+                ))
+            # otherwise it's an image (url/base64/file)
             elif line in image_outputs:
-                outputs.append(
-                    NamedEmbedding(input=line, embedding=image_outputs[line].tolist())
-                )
+                outputs.append(NamedEmbedding(
+                    input=line,
+                    embedding=image_outputs[line].tolist()
+                ))
+            else:
+                # fallback if we missed something
+                outputs.append(NamedEmbedding(input=line, embedding=[]))
 
         return outputs
