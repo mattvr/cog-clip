@@ -3,7 +3,7 @@ import sys
 import base64
 import requests
 from io import BytesIO
-from typing import List, Optional
+from typing import List
 from PIL import Image
 from transformers import CLIPProcessor, CLIPModel
 from cog import BasePredictor, Path, Input, BaseModel, File
@@ -24,10 +24,10 @@ class Predictor(BasePredictor):
             description="Newline-separated inputs. Can be text strings, base64 data URIs, or image URLs starting with http[s]://",
             default="a\nb",
         ),
-        # optional list of direct image files
-        image_files: Optional[List[File]] = Input(
+        # list of direct image files
+        image_files: List[File] = Input(
             description="List of direct image files for batch processing",
-            default=None
+            default=[]
         )
     ) -> List[NamedEmbedding]:
 
@@ -66,20 +66,19 @@ class Predictor(BasePredictor):
                 texts.append(line)
 
         # 2) parse direct image files if provided
-        if image_files:
-            for idx, f in enumerate(image_files):
-                try:
-                    image = Image.open(f)
-                    images.append(image)
-                    # give each file a unique placeholder ID so we can output it later
-                    file_key = f"file_{idx}"
-                    image_ids.append(file_key)
-                    lines.append(file_key)  # so final output is consistent with text paths
-                except Exception as e:
-                    print(f"Failed to open file {f.name}: {e}", file=sys.stderr)
+        for i, f in enumerate(image_files):
+            try:
+                img = Image.open(f)
+                images.append(img)
+                file_key = f"uploaded_file_{i}"
+                image_ids.append(file_key)
+                # add a dummy line so we keep the final ordering consistent
+                lines.append(file_key)
+            except Exception as e:
+                print(f"failed to open file: {f.name}\nerror: {e}", file=sys.stderr)
 
         # handle 'None' inputs for processor
-        if not images:
+        if len(images) == 0:
             images_for_processor = None
         else:
             images_for_processor = images
